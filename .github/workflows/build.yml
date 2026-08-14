@@ -63,10 +63,16 @@ jobs:
           name: packages
           path: dist/nuget/*.nupkg
 
-  # Publishing means copying the packages into the Builds folder of the company SharePoint library, which a
-  # hosted runner cannot see: it is a synced folder on our own machines. So this runs on the self-hosted
-  # Windows runner, and is gated on a variable rather than on a label - a job asking for a runner that does not
-  # exist queues for six hours and then fails, which is worse than not running.
+  # Publishing is two places at once: the Builds folder on SharePoint, which is how everybody else gets the
+  # packages, and the folder this machine restores from, so the next build here has something to restore.
+  #
+  # SharePoint is reached through Graph rather than a synced folder, because the runner does not sync the
+  # library. The app registration holds Sites.Selected, which is a permission to *be granted* access per site
+  # rather than access itself - if this ever returns 403, that per-site grant is the first thing to check and
+  # almost always the answer.
+  #
+  # Runs on the self-hosted runner and is gated on a variable rather than a label: a job asking for a runner
+  # that does not exist queues for six hours and then fails, which is worse than not running.
   publish:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') && vars.PHENOME_SELF_HOSTED == 'true'
@@ -78,29 +84,48 @@ jobs:
           name: packages
           path: dist/nuget
 
-      - name: Copy to the Builds folder
+      - name: Publish
         shell: pwsh
+        env:
+          TENANT: ${{ vars.PHENOME_GRAPH_TENANT }}
+          CLIENT_ID: ${{ vars.PHENOME_GRAPH_CLIENT_ID }}
+          SECRET: ${{ secrets.PHENOME_GRAPH_SECRET }}
+          DRIVE: ${{ vars.PHENOME_PUBLISH_DRIVE }}
+          FOLDER: ${{ vars.PHENOME_PUBLISH_FOLDER }}
+          TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
         run: |
-          # Forward slashes on purpose: PowerShell takes them on Windows, and they survive every layer
-          # of quoting between here and the runner without turning into an escape.
-          $feed = Join-Path $env:USERPROFILE 'Object/Object - Documents/Workers WO/Builds/Phenome/nuget'
-          if (-not (Test-Path $feed)) {
-            throw "The package folder is not at $feed - is the SharePoint library synced on this runner?"
+          $packages = Get-ChildItem dist/nuget -Filter '*.nupkg'
+          if (-not $packages) { throw 'nothing to publish' }
+
+          # The local feed first: it is what every build on this machine restores from, and it works whether or
+          # not SharePoint does.
+          if (-not $env:PHENOME_FEED) { throw 'PHENOME_FEED is not set on this runner' }
+          New-Item -ItemType Directory -Force $env:PHENOME_FEED | Out-Null
+          $packages | ForEach-Object { Copy-Item $_.FullName $env:PHENOME_FEED -Force }
+          Write-Host "  $($packages.Count) package(s) -> $env:PHENOME_FEED"
+
+          foreach ($name in 'TENANT','CLIENT_ID','SECRET','DRIVE','FOLDER') {
+            if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue).Value) {
+              Write-Host "  $name is not set - published locally only, nothing sent to SharePoint."
+              exit 0
+            }
           }
 
-          $packages = Get-ChildItem dist/nuget -Filter '*.nupkg'
-          $packages | ForEach-Object { Copy-Item $_.FullName $feed -Force; "  $($_.Name) -> Builds" }
+          $token = (Invoke-RestMethod -Method POST -Uri "https://login.microsoftonline.com/$env:TENANT/oauth2/v2.0/token" -Body @{
+            client_id = $env:CLIENT_ID; client_secret = $env:SECRET
+            scope = 'https://graph.microsoft.com/.default'; grant_type = 'client_credentials'
+          }).access_token
+          $headers = @{ Authorization = "Bearer $token" }
 
-          # OneDrive takes its own time: the file is here before it is anywhere else, so a build on another
-          # machine immediately after this may still restore the previous version.
-          Write-Host '  published locally; OneDrive syncs it to everybody else in its own time'
+          foreach ($p in $packages) {
+            $uri = "https://graph.microsoft.com/v1.0/drives/$env:DRIVE/root:/$env:FOLDER/$($p.Name)`:/content"
+            $up = Invoke-RestMethod -Method PUT -Headers $headers -ContentType 'application/octet-stream' `
+              -InFile $p.FullName -Uri $uri
+            Write-Host "  $($up.name) -> SharePoint, $($up.size) bytes"
+          }
 
           if ($env:TEAMS_WEBHOOK) {
             $names = ($packages | ForEach-Object { $_.BaseName }) -join ', '
-            $body = @{ text = "**$names** published to Builds on SharePoint." } | ConvertTo-Json
+            $body = @{ text = "**$names** published to Builds." } | ConvertTo-Json
             Invoke-RestMethod -Uri $env:TEAMS_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
-            Write-Host '  Teams notified'
           }
-          else { Write-Host '  TEAMS_WEBHOOK is not set - nobody notified' }
-        env:
-          TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
