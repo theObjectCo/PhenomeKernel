@@ -63,8 +63,9 @@ jobs:
           name: packages
           path: dist/nuget/*.nupkg
 
-  # Publishing is two places at once: the Builds folder on SharePoint, which is how everybody else gets the
-  # packages, and the folder this machine restores from, so the next build here has something to restore.
+  # Publishing goes to SharePoint and nowhere else. Every machine keeps a cache folder that NuGet restores
+  # from, filled from here at the start of a build - so there is one writer and one version of the truth, and
+  # no runner can end up holding a package nobody else has.
   #
   # SharePoint is reached through Graph rather than a synced folder, because the runner does not sync the
   # library. The app registration holds Sites.Selected, which is a permission to *be granted* access per site
@@ -97,17 +98,9 @@ jobs:
           $packages = Get-ChildItem dist/nuget -Filter '*.nupkg'
           if (-not $packages) { throw 'nothing to publish' }
 
-          # The local feed first: it is what every build on this machine restores from, and it works whether or
-          # not SharePoint does.
-          if (-not $env:PHENOME_FEED) { throw 'PHENOME_FEED is not set on this runner' }
-          New-Item -ItemType Directory -Force $env:PHENOME_FEED | Out-Null
-          $packages | ForEach-Object { Copy-Item $_.FullName $env:PHENOME_FEED -Force }
-          Write-Host "  $($packages.Count) package(s) -> $env:PHENOME_FEED"
-
           foreach ($name in 'TENANT','CLIENT_ID','SECRET','DRIVE','FOLDER') {
             if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue).Value) {
-              Write-Host "  $name is not set - published locally only, nothing sent to SharePoint."
-              exit 0
+              throw "$name is not set - nothing can be published."
             }
           }
 
