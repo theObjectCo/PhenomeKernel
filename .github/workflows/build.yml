@@ -1,0 +1,94 @@
+# Builds the kernel, runs its tests and packs both libraries.
+#
+# The packages are uploaded as artifacts on every push and pushed to a feed only from a tag. Publishing to
+# nuget.org is deliberately not here: a version cannot be deleted from it, only unlisted, and the API is still
+# moving at 0.1.0-alpha. When that stops being true, this file gains one step.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          # net7.0 is out of support and its targeting pack is not in the image by default. The kernel builds
+          # for it because Rhino 8 hosts .NET 7, so the runner needs both.
+          dotnet-version: |
+            7.0.x
+            10.0.x
+
+      # No feed is needed to build this: nothing here depends on a Phenome package, which is the whole reason
+      # the kernel is the one project that can be built by anybody from a clean clone.
+      - name: Build
+        run: dotnet build src/Phenome.Geometry/Phenome.Geometry.csproj -c Release
+
+      - name: Build the Rhino conversions
+        run: dotnet build src/Phenome.RhinoInterop/Phenome.RhinoInterop.csproj -c Release
+
+      - name: Test
+        run: dotnet test tests/Phenome.Geometry.Tests -c Release --logger 'console;verbosity=normal'
+
+      - name: Pack
+        run: |
+          dotnet pack src/Phenome.Geometry/Phenome.Geometry.csproj -c Release -o dist/nuget
+          dotnet pack src/Phenome.RhinoInterop/Phenome.RhinoInterop.csproj -c Release -o dist/nuget
+
+      # Checked rather than assumed: a package whose lib/ is empty, or which lost its documentation, has
+      # happened here before and both times `pack` reported success.
+      - name: Check the packages carry what they must
+        run: |
+          set -e
+          for pkg in dist/nuget/*.nupkg; do
+            echo "== $pkg"
+            unzip -l "$pkg" | grep -E 'lib/net(7|10)\.0/.*\.(dll|xml)$' || {
+              echo "no assemblies or no documentation in $pkg"; exit 1; }
+          done
+          unzip -l dist/nuget/Phenome.Geometry.*.nupkg | grep -q 'lib/net7.0/' || {
+            echo 'Phenome.Geometry has no net7.0, so no Rhino plugin can use it'; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/nuget/*.nupkg
+
+  publish:
+    # Only from a tag, and only when a feed has been configured. Without the variables this job is skipped
+    # rather than failing, because the feed is somebody's one-time setup and not a fact about the code.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist/nuget
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Push to the feed
+        env:
+          FEED: ${{ vars.PHENOME_FEED_URL }}
+          TOKEN: ${{ secrets.PHENOME_FEED_TOKEN }}
+        run: |
+          if [ -z "$FEED" ] || [ -z "$TOKEN" ]; then
+            echo "PHENOME_FEED_URL or PHENOME_FEED_TOKEN is not set - nothing pushed."
+            echo "See README: the feed is a one-time setup."
+            exit 0
+          fi
+          dotnet nuget add source "$FEED" --name phenome --username ci \
+            --password "$TOKEN" --store-password-in-clear-text
+          dotnet nuget push 'dist/nuget/*.nupkg' --source phenome --api-key az --skip-duplicate
