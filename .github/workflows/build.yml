@@ -1,8 +1,9 @@
 # Builds the kernel, runs its tests and packs both libraries.
 #
-# The packages are uploaded as artifacts on every push and pushed to a feed only from a tag. Publishing to
-# nuget.org is deliberately not here: a version cannot be deleted from it, only unlisted, and the API is still
-# moving at 0.1.0-alpha. When that stops being true, this file gains one step.
+# The packages are uploaded as artifacts on every push, and from a tag they are copied into the Builds folder of
+# the company SharePoint library - which is the feed everything else restores from. Publishing to nuget.org is
+# deliberately not here: a version cannot be deleted from it, only unlisted, and the API is still moving at
+# 0.1.0-alpha. When that stops being true, this file gains one step.
 name: build
 
 on:
@@ -62,12 +63,14 @@ jobs:
           name: packages
           path: dist/nuget/*.nupkg
 
+  # Publishing means copying the packages into the Builds folder of the company SharePoint library, which a
+  # hosted runner cannot see: it is a synced folder on our own machines. So this runs on the self-hosted
+  # Windows runner, and is gated on a variable rather than on a label - a job asking for a runner that does not
+  # exist queues for six hours and then fails, which is worse than not running.
   publish:
-    # Only from a tag, and only when a feed has been configured. Without the variables this job is skipped
-    # rather than failing, because the feed is somebody's one-time setup and not a fact about the code.
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PHENOME_SELF_HOSTED == 'true'
+    runs-on: [self-hosted, windows]
 
     steps:
       - uses: actions/download-artifact@v4
@@ -75,20 +78,29 @@ jobs:
           name: packages
           path: dist/nuget
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
-
-      - name: Push to the feed
-        env:
-          FEED: ${{ vars.PHENOME_FEED_URL }}
-          TOKEN: ${{ secrets.PHENOME_FEED_TOKEN }}
+      - name: Copy to the Builds folder
+        shell: pwsh
         run: |
-          if [ -z "$FEED" ] || [ -z "$TOKEN" ]; then
-            echo "PHENOME_FEED_URL or PHENOME_FEED_TOKEN is not set - nothing pushed."
-            echo "See README: the feed is a one-time setup."
-            exit 0
-          fi
-          dotnet nuget add source "$FEED" --name phenome --username ci \
-            --password "$TOKEN" --store-password-in-clear-text
-          dotnet nuget push 'dist/nuget/*.nupkg' --source phenome --api-key az --skip-duplicate
+          # Forward slashes on purpose: PowerShell takes them on Windows, and they survive every layer
+          # of quoting between here and the runner without turning into an escape.
+          $feed = Join-Path $env:USERPROFILE 'Object/Object - Documents/Workers WO/Builds/Phenome/nuget'
+          if (-not (Test-Path $feed)) {
+            throw "The package folder is not at $feed - is the SharePoint library synced on this runner?"
+          }
+
+          $packages = Get-ChildItem dist/nuget -Filter '*.nupkg'
+          $packages | ForEach-Object { Copy-Item $_.FullName $feed -Force; "  $($_.Name) -> Builds" }
+
+          # OneDrive takes its own time: the file is here before it is anywhere else, so a build on another
+          # machine immediately after this may still restore the previous version.
+          Write-Host '  published locally; OneDrive syncs it to everybody else in its own time'
+
+          if ($env:TEAMS_WEBHOOK) {
+            $names = ($packages | ForEach-Object { $_.BaseName }) -join ', '
+            $body = @{ text = "**$names** published to Builds on SharePoint." } | ConvertTo-Json
+            Invoke-RestMethod -Uri $env:TEAMS_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
+            Write-Host '  Teams notified'
+          }
+          else { Write-Host '  TEAMS_WEBHOOK is not set - nobody notified' }
+        env:
+          TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
