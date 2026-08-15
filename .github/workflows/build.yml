@@ -117,8 +117,26 @@ jobs:
             Write-Host "  $($up.name) -> SharePoint, $($up.size) bytes"
           }
 
-          if ($env:TEAMS_WEBHOOK) {
-            $names = ($packages | ForEach-Object { $_.BaseName }) -join ', '
-            $body = @{ text = "**$names** published to Builds." } | ConvertTo-Json
-            Invoke-RestMethod -Uri $env:TEAMS_WEBHOOK -Method Post -ContentType 'application/json' -Body $body
+          # An Adaptive Card, because a Power Automate workflow webhook takes nothing else - and that is the
+          # only kind Teams creates now that the Office 365 connectors are retired. The old {"text": "..."}
+          # shape is answered with 202 and posted nowhere, which reads exactly like success.
+          if (-not $env:TEAMS_WEBHOOK) { Write-Host '  TEAMS_WEBHOOK is not set - nobody notified'; return }
+
+          $names = ($packages | ForEach-Object { $_.BaseName }) -join ', '
+          $body = @{
+            type = 'message'
+            attachments = @(@{
+              contentType = 'application/vnd.microsoft.card.adaptive'
+              content = @{
+                '$schema' = 'http://adaptivecards.io/schemas/adaptive-card.json'
+                type = 'AdaptiveCard'; version = '1.5'
+                body = @(@{ type = 'TextBlock'; text = "**$names** published to Builds."; wrap = $true })
+              }
+            })
+          } | ConvertTo-Json -Depth 10
+
+          try {
+            Invoke-RestMethod -Uri $env:TEAMS_WEBHOOK -Method Post -ContentType 'application/json' -Body $body | Out-Null
+            Write-Host '  notified Teams'
           }
+          catch { Write-Host "  Teams refused the message: $($_.Exception.Message)" }
