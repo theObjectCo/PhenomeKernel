@@ -92,7 +92,7 @@ jobs:
           CLIENT_ID: ${{ vars.PHENOME_GRAPH_CLIENT_ID }}
           SECRET: ${{ secrets.PHENOME_GRAPH_SECRET }}
           DRIVE: ${{ vars.PHENOME_PUBLISH_DRIVE }}
-          FOLDER: ${{ vars.PHENOME_PUBLISH_FOLDER }}
+          FOLDER: ${{ vars.PHENOME_NUGET_FOLDER }}
           TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
         run: |
           $packages = Get-ChildItem dist/nuget -Filter '*.nupkg'
