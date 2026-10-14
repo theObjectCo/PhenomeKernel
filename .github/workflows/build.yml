@@ -72,12 +72,13 @@ jobs:
   # rather than access itself - if this ever returns 403, that per-site grant is the first thing to check and
   # almost always the answer.
   #
-  # Runs on the self-hosted runner and is gated on a variable rather than a label: a job asking for a runner
-  # that does not exist queues for six hours and then fails, which is worse than not running.
+  # Runs on the self-hosted Linux runner (a container in WSL on DESKTOP-MZ3; the step only needs pwsh) and is
+  # gated on a variable rather than a label: a job asking for a runner that does not exist queues for six
+  # hours and then fails, which is worse than not running.
   publish:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') && vars.PHENOME_SELF_HOSTED == 'true'
-    runs-on: [self-hosted, windows]
+    runs-on: [self-hosted, linux]
 
     steps:
       - uses: actions/download-artifact@v4
